@@ -1,0 +1,30 @@
+{
+  "name": "ai-security-copilot",
+  "displayName": "AI Security Copilot",
+  "description": "Scans code on file save, detects basic security vulnerabilities.",
+  "version": "1.0.0",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Linters"
+  ],
+  "activationEvents": [
+    "*"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": []
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.80.0",
+    "@types/node": "18.x",
+    "typescript": "^5.1.3"
+  }
+}
