@@ -7,6 +7,7 @@ exports.applyAllFixes = applyAllFixes;
 const vscode = require("vscode");
 const fixEngine_1 = require("./fixEngine");
 const child_process_1 = require("child_process");
+const prompts_1 = require("./prompts");
 // ── Notification Sound Helper ────────────────────────────────────────────────
 function playNotificationSound() {
     try {
@@ -70,20 +71,22 @@ async function applySecurityFix(document, diagnostic) {
         vscode.window.showErrorMessage(`SecureStack: No fix available for "${issueMsg.substring(0, 60)}..."`);
         return false;
     }
-    const edit = new vscode.WorkspaceEdit();
     let fixText = result.fix;
     if (!fixText.endsWith('\n')) {
         fixText += '\n';
     }
     const fixLinesCount = fixText.split(/\r?\n/).length - 1;
-    edit.insert(document.uri, new vscode.Position(lineNum + 1, 0), fixText);
-    await vscode.workspace.applyEdit(edit);
     const changes = [{
             originalLineNum: lineNum,
             insertedLineNum: lineNum + 1,
-            fixLinesCount
+            fixLinesCount,
+            fixText
         }];
-    const editor = vscode.window.activeTextEditor;
+    const previewEdit = new vscode.WorkspaceEdit();
+    previewEdit.insert(document.uri, new vscode.Position(lineNum + 1, 0), fixText);
+    await vscode.workspace.applyEdit(previewEdit);
+    let editor = vscode.window.activeTextEditor;
+    editor = vscode.window.activeTextEditor;
     if (editor && editor.document === document) {
         editor.setDecorations(redBackground, [document.lineAt(lineNum).range]);
         if (fixLinesCount > 0) {
@@ -99,12 +102,17 @@ async function applySecurityFix(document, diagnostic) {
         editor.setDecorations(redBackground, []);
         editor.setDecorations(greenBackground, []);
     }
+    // Unconditionally undo the preview insert to keep the undo stack perfectly clean
+    if (vscode.window.activeTextEditor?.document !== document) {
+        await vscode.window.showTextDocument(document);
+    }
+    await vscode.commands.executeCommand('undo');
     if (action === 'Accept') {
-        const acceptEdit = new vscode.WorkspaceEdit();
+        const finalEdit = new vscode.WorkspaceEdit();
         for (const change of changes) {
-            acceptEdit.delete(document.uri, document.lineAt(change.originalLineNum).rangeIncludingLineBreak);
+            finalEdit.replace(document.uri, document.lineAt(change.originalLineNum).rangeIncludingLineBreak, change.fixText);
         }
-        await vscode.workspace.applyEdit(acceptEdit);
+        await vscode.workspace.applyEdit(finalEdit);
         if (result.envUpdate) {
             const existingKeys = await getExistingEnvKeys(document.uri);
             if (!existingKeys.has(result.envUpdate.key)) {
@@ -116,16 +124,7 @@ async function applySecurityFix(document, diagnostic) {
         }
         return true;
     }
-    else {
-        const rejectEdit = new vscode.WorkspaceEdit();
-        for (const change of changes) {
-            const start = new vscode.Position(change.insertedLineNum, 0);
-            const end = new vscode.Position(change.insertedLineNum + change.fixLinesCount, 0);
-            rejectEdit.delete(document.uri, new vscode.Range(start, end));
-        }
-        await vscode.workspace.applyEdit(rejectEdit);
-        return false;
-    }
+    return false;
 }
 // ── Apply fix by URI + line number (used by hover command link) ──────────────
 async function applyFixAtPosition(uriString, lineNum, dc) {
@@ -196,7 +195,8 @@ async function applyAllFixes(document, diagnosticsCollection) {
                 changes.push({
                     originalLineNum: lineNum,
                     insertedLineNum: lineNum + 1,
-                    fixLinesCount
+                    fixLinesCount,
+                    fixText
                 });
                 if (result.envUpdate) {
                     envUpdates.push(result.envUpdate);
@@ -208,7 +208,7 @@ async function applyAllFixes(document, diagnosticsCollection) {
         if (fixed > 0) {
             await vscode.workspace.applyEdit(batchEdit);
             changes.reverse();
-            const editor = vscode.window.activeTextEditor;
+            let editor = vscode.window.activeTextEditor;
             if (editor && editor.document === current) {
                 const redRanges = changes.map(c => current.lineAt(c.originalLineNum).range);
                 const greenRanges = changes.map(c => {
@@ -228,13 +228,17 @@ async function applyAllFixes(document, diagnosticsCollection) {
                 editor.setDecorations(redBackground, []);
                 editor.setDecorations(greenBackground, []);
             }
+            if (vscode.window.activeTextEditor?.document !== current) {
+                await vscode.window.showTextDocument(current);
+            }
+            await vscode.commands.executeCommand('undo');
             if (action === 'Accept All') {
-                const acceptEdit = new vscode.WorkspaceEdit();
+                const finalEdit = new vscode.WorkspaceEdit();
                 const sortedDesc = [...changes].sort((a, b) => b.originalLineNum - a.originalLineNum);
                 for (const change of sortedDesc) {
-                    acceptEdit.delete(document.uri, document.lineAt(change.originalLineNum).rangeIncludingLineBreak);
+                    finalEdit.replace(document.uri, current.lineAt(change.originalLineNum).rangeIncludingLineBreak, change.fixText);
                 }
-                await vscode.workspace.applyEdit(acceptEdit);
+                await vscode.workspace.applyEdit(finalEdit);
                 if (envUpdates.length > 0) {
                     const existingKeys = await getExistingEnvKeys(document.uri);
                     const newUpdates = envUpdates.filter(u => !existingKeys.has(u.key));
@@ -245,16 +249,6 @@ async function applyAllFixes(document, diagnosticsCollection) {
                         }
                     }
                 }
-            }
-            else {
-                const rejectEdit = new vscode.WorkspaceEdit();
-                const sortedDesc = [...changes].sort((a, b) => b.insertedLineNum - a.insertedLineNum);
-                for (const change of sortedDesc) {
-                    const start = new vscode.Position(change.insertedLineNum, 0);
-                    const end = new vscode.Position(change.insertedLineNum + change.fixLinesCount, 0);
-                    rejectEdit.delete(document.uri, new vscode.Range(start, end));
-                }
-                await vscode.workspace.applyEdit(rejectEdit);
             }
         }
     });
@@ -325,7 +319,7 @@ async function fetchApiFix(code, issueMessage, line) {
         const response = await fetch('http://localhost:3000/analyze', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ code, issue: issueMessage, line }),
+            body: JSON.stringify({ code, issue: issueMessage, line, systemPrompt: prompts_1.SECURE_AI_SYSTEM_PROMPT }),
             signal: AbortSignal.timeout(10_000)
         });
         if (!response.ok) {
