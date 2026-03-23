@@ -5,62 +5,103 @@ exports.deactivate = deactivate;
 const vscode = require("vscode");
 const analyzer_1 = require("./analyzer");
 const diagnostics_1 = require("./diagnostics");
+const codeActions_1 = require("./codeActions");
+// Severity colour palette (ruler only — underlines come from diagnostics)
+const SEV_COLOR = {
+    critical: '#ff4d4d',
+    warning: '#ffaa00',
+    info: '#4da6ff'
+};
+// Severity ordering (higher = worse)
+const SEV_ORDER = { critical: 3, warning: 2, info: 1 };
+function makeDecorationType(sev) {
+    return vscode.window.createTextEditorDecorationType({
+        overviewRulerColor: SEV_COLOR[sev],
+        overviewRulerLane: vscode.OverviewRulerLane.Right
+    });
+}
 function activate(context) {
-    console.log('AI Security Copilot extension is now active.');
+    console.log('🛡️ SecureStack Copilot is now active.');
+    // ── Diagnostics collection ───────────────────────────────────────────────
     const diagnosticCollection = vscode.languages.createDiagnosticCollection('aiSecurityCopilot');
     context.subscriptions.push(diagnosticCollection);
-    // Create an inline decoration type for visual badges
-    const securityDecorationType = vscode.window.createTextEditorDecorationType({
-        after: {
-            contentText: ' 🛡️',
-            color: '#ffaa00',
-            margin: '0 0 0 20px',
-            textDecoration: 'none; font-weight: bold; font-size: 11px; background-color: rgba(255, 170, 0, 0.1); padding: 2px 6px; border-radius: 4px; border: 1px solid rgba(255, 170, 0, 0.3);'
+    // ── Severity-coloured inline decorations ─────────────────────────────────
+    const decorationTypes = {
+        critical: makeDecorationType('critical'),
+        warning: makeDecorationType('warning'),
+        info: makeDecorationType('info')
+    };
+    for (const dt of Object.values(decorationTypes)) {
+        context.subscriptions.push(dt);
+    }
+    // ── Quick Fix code action provider ───────────────────────────────────────
+    context.subscriptions.push(vscode.languages.registerCodeActionsProvider({ scheme: 'file' }, new codeActions_1.SecurityCodeActionProvider(), { providedCodeActionKinds: codeActions_1.SecurityCodeActionProvider.providedCodeActionKinds }));
+    // ── Command: fix single issue (from Quick Fix lightbulb) ─────────────────
+    context.subscriptions.push(vscode.commands.registerCommand('aiSecurityCopilot.fixIssue', async (document, diagnostic) => {
+        await (0, codeActions_1.applySecurityFix)(document, diagnostic);
+    }));
+    // ── Command: fix at position (invoked from hover markdown command URI) ────
+    context.subscriptions.push(vscode.commands.registerCommand('aiSecurityCopilot.fixAtPosition', async (uriString, lineNum) => {
+        await (0, codeActions_1.applyFixAtPosition)(uriString, lineNum, diagnosticCollection);
+    }));
+    // ── Command: fix all issues in the active file ───────────────────────────
+    context.subscriptions.push(vscode.commands.registerCommand('aiSecurityCopilot.fixAllInFile', async () => {
+        const editor = vscode.window.activeTextEditor;
+        if (!editor) {
+            vscode.window.showWarningMessage('SecureStack: No active editor.');
+            return;
         }
-    });
+        await (0, codeActions_1.applyAllFixes)(editor.document, diagnosticCollection);
+    }));
+    // ── Analyse document and apply decorations ───────────────────────────────
     const analyzeDocument = (document) => {
         if (document.uri.scheme !== 'file') {
             return;
         }
-        const code = document.getText();
-        const issues = (0, analyzer_1.analyzeCode)(code);
+        if (document.fileName.endsWith('.env')) {
+            return;
+        }
+        const issues = (0, analyzer_1.analyzeCode)(document.getText());
         (0, diagnostics_1.updateDiagnostics)(document, diagnosticCollection, issues);
-        // Apply visual inline decorations to all visible editors of this document
-        const editors = vscode.window.visibleTextEditors.filter(editor => editor.document.uri.toString() === document.uri.toString());
-        const decorations = issues.map(issue => {
-            const line = document.lineAt(issue.line);
-            return {
-                range: new vscode.Range(issue.line, line.text.length, issue.line, line.text.length)
-            };
-        });
+        const editors = vscode.window.visibleTextEditors.filter(e => e.document.uri.toString() === document.uri.toString());
+        // One decoration per line — pick worst severity for that line
+        const lineSeverity = new Map();
+        for (const issue of issues) {
+            if (issue.line < 0 || issue.line >= document.lineCount) {
+                continue;
+            }
+            const existing = lineSeverity.get(issue.line);
+            if (!existing || SEV_ORDER[issue.severity] > SEV_ORDER[existing]) {
+                lineSeverity.set(issue.line, issue.severity);
+            }
+        }
+        const buckets = {
+            critical: [], warning: [], info: []
+        };
+        for (const [lineNum, sev] of lineSeverity) {
+            const lineLength = document.lineAt(lineNum).text.length;
+            buckets[sev].push({
+                range: new vscode.Range(lineNum, lineLength, lineNum, lineLength)
+            });
+        }
         for (const editor of editors) {
-            editor.setDecorations(securityDecorationType, decorations);
+            for (const sev of Object.keys(buckets)) {
+                editor.setDecorations(decorationTypes[sev], buckets[sev]);
+            }
         }
     };
-    // Analyze currently active document on startup
+    // Run on startup for the active document
     if (vscode.window.activeTextEditor) {
         analyzeDocument(vscode.window.activeTextEditor.document);
     }
-    // Analyze when a file is opened
-    context.subscriptions.push(vscode.workspace.onDidOpenTextDocument(document => {
-        analyzeDocument(document);
-    }));
-    // Analyze when active editor changes
-    context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(editor => {
-        if (editor) {
-            analyzeDocument(editor.document);
-        }
-    }));
-    // Analyze on file save
-    context.subscriptions.push(vscode.workspace.onDidSaveTextDocument(document => {
-        analyzeDocument(document);
-    }));
-    // Clear diagnostics when file is closed
-    context.subscriptions.push(vscode.workspace.onDidCloseTextDocument(document => {
-        diagnosticCollection.delete(document.uri);
-    }));
+    context.subscriptions.push(vscode.workspace.onDidOpenTextDocument(doc => analyzeDocument(doc)));
+    context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(e => { if (e) {
+        analyzeDocument(e.document);
+    } }));
+    context.subscriptions.push(vscode.workspace.onDidSaveTextDocument(doc => analyzeDocument(doc)));
+    context.subscriptions.push(vscode.workspace.onDidCloseTextDocument(doc => diagnosticCollection.delete(doc.uri)));
 }
 function deactivate() {
-    console.log('AI Security Copilot extension deactivated.');
+    console.log('🛡️ SecureStack Copilot deactivated.');
 }
 //# sourceMappingURL=extension.js.map

@@ -1,20 +1,43 @@
 {
   "name": "ai-security-copilot",
-  "displayName": "AI Security Copilot",
-  "description": "Scans code on file save, detects basic security vulnerabilities.",
-  "version": "1.0.0",
+  "displayName": "SecureStack Copilot",
+  "description": "Detects security vulnerabilities and provides AI-powered fixes.",
+  "version": "1.1.0",
   "engines": {
     "vscode": "^1.80.0"
   },
   "categories": [
-    "Linters"
+    "Linters",
+    "Other"
   ],
   "activationEvents": [
     "*"
   ],
   "main": "./out/extension.js",
   "contributes": {
-    "commands": []
+    "commands": [
+      {
+        "command": "aiSecurityCopilot.fixAllInFile",
+        "title": "🛡️ Fix All Issues in File",
+        "category": "SecureStack"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "aiSecurityCopilot.fixAllInFile",
+          "when": "editorFocus",
+          "group": "1_modification@100"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "aiSecurityCopilot.fixAllInFile",
+          "when": "editorFocus",
+          "group": "navigation"
+        }
+      ]
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",

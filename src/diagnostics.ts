@@ -6,19 +6,13 @@ export function updateDiagnostics(
     collection: vscode.DiagnosticCollection,
     issues: Issue[]
 ) {
-    // Clear previous diagnostics
     collection.set(document.uri, []);
-    
-    if (document.lineCount === 0) {
-        return;
-    }
+    if (document.lineCount === 0) { return; }
 
     const diagnostics: vscode.Diagnostic[] = [];
 
     for (const issue of issues) {
-        if (issue.line < 0 || issue.line >= document.lineCount) {
-            continue;
-        }
+        if (issue.line < 0 || issue.line >= document.lineCount) { continue; }
 
         const line = document.lineAt(issue.line);
         const range = new vscode.Range(
@@ -28,12 +22,16 @@ export function updateDiagnostics(
             line.text.length
         );
 
-        const diagnostic = new vscode.Diagnostic(
-            range,
-            issue.message,
-            vscode.DiagnosticSeverity.Warning
-        );
+        // Map our severity → VS Code DiagnosticSeverity
+        const vsSeverity =
+            issue.severity === 'critical'  ? vscode.DiagnosticSeverity.Error :
+            issue.severity === 'info'      ? vscode.DiagnosticSeverity.Information :
+                                             vscode.DiagnosticSeverity.Warning;
+
+        const diagnostic = new vscode.Diagnostic(range, issue.message, vsSeverity);
         diagnostic.source = '🛡️ AI Security Copilot';
+        // Store our custom severity string in `code` so the hover provider can read it
+        diagnostic.code = issue.severity;
 
         diagnostics.push(diagnostic);
     }
