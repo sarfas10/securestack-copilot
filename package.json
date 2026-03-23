@@ -29,13 +29,6 @@
           "when": "editorFocus",
           "group": "1_modification@100"
         }
-      ],
-      "editor/title": [
-        {
-          "command": "aiSecurityCopilot.fixAllInFile",
-          "when": "editorFocus",
-          "group": "navigation"
-        }
       ]
     }
   },

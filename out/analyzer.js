@@ -15,6 +15,10 @@ function analyzeCode(code) {
     const lines = code.split(/\r?\n/);
     for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
+        // ── ALLOW EXPLICIT IGNORING ───────────────────────────────────────────
+        if (line.includes('securestack-disable-line')) {
+            continue;
+        }
         // ── 1. SQL INJECTION ──────────────────────────────────────────────────
         if (/\b(SELECT|INSERT|UPDATE|DELETE|DROP|UNION)\b.*?(\+\s*\w|\$\{)/i.test(line)) {
             push(issues, i, "SQL Injection: User input concatenated into SQL query. Use parameterized queries.", 'critical');
@@ -47,7 +51,7 @@ function analyzeCode(code) {
             push(issues, i, "Code Injection: setTimeout/setInterval with a string argument executes code like eval. Use a function reference.", 'warning');
         }
         // ── 5. COMMAND INJECTION ──────────────────────────────────────────────
-        if (/\b(?:exec|execSync|execFile|spawn|spawnSync|system)\s*\(/.test(line) &&
+        if (/\b(?:exec|execSync|system)\s*\(/.test(line) &&
             /(\+\s*\w|\$\{|req\.|params\.|query\.|body\.)/.test(line)) {
             push(issues, i, "Command Injection: Shell command built with dynamic input. Sanitize arguments or use safer APIs.", 'critical');
         }

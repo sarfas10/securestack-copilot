@@ -6,6 +6,33 @@ exports.applyFixAtPosition = applyFixAtPosition;
 exports.applyAllFixes = applyAllFixes;
 const vscode = require("vscode");
 const fixEngine_1 = require("./fixEngine");
+const child_process_1 = require("child_process");
+// ── Notification Sound Helper ────────────────────────────────────────────────
+function playNotificationSound() {
+    try {
+        if (process.platform === 'win32') {
+            (0, child_process_1.exec)('powershell -c "[System.Media.SystemSounds]::Asterisk.Play()"');
+        }
+        else if (process.platform === 'darwin') {
+            (0, child_process_1.exec)('afplay /System/Library/Sounds/Ping.aiff');
+        }
+        else {
+            (0, child_process_1.exec)('paplay /usr/share/sounds/freedesktop/stereo/message.oga');
+        }
+    }
+    catch {
+        // Suppress failures if audio isn't available
+    }
+}
+// ── Inline Preview Decorators ───────────────────────────────────────────────
+const redBackground = vscode.window.createTextEditorDecorationType({
+    backgroundColor: 'rgba(255, 0, 0, 0.2)',
+    isWholeLine: true
+});
+const greenBackground = vscode.window.createTextEditorDecorationType({
+    backgroundColor: 'rgba(0, 255, 0, 0.2)',
+    isWholeLine: true
+});
 // ── Quick Fix code action provider ──────────────────────────────────────────
 class SecurityCodeActionProvider {
     static providedCodeActionKinds = [
@@ -35,9 +62,7 @@ async function applySecurityFix(document, diagnostic) {
     const lineNum = diagnostic.range.start.line;
     const lineText = document.lineAt(lineNum).text;
     const issueMsg = diagnostic.message;
-    // 1. Try inbuilt fix engine first
     let result = (0, fixEngine_1.getInbuiltFix)(lineText, issueMsg, lineNum);
-    // 2. Fall back to backend API if no inbuilt fix found
     if (!result) {
         result = await fetchApiFix(document.getText(), issueMsg, lineNum);
     }
@@ -45,23 +70,62 @@ async function applySecurityFix(document, diagnostic) {
         vscode.window.showErrorMessage(`SecureStack: No fix available for "${issueMsg.substring(0, 60)}..."`);
         return false;
     }
-    if (result.envUpdate) {
-        const action = await vscode.window.showInformationMessage(`SecureStack found a hardcoded secret. Extract it to a .env file automatically?`, 'Yes', 'No');
-        if (action !== 'Yes') {
-            return false; // Cancel fix if not permitted
-        }
-        await appendToEnv(document.uri, [result.envUpdate]);
-    }
     const edit = new vscode.WorkspaceEdit();
-    edit.replace(document.uri, document.lineAt(lineNum).range, result.fix);
-    const success = await vscode.workspace.applyEdit(edit);
-    if (success) {
-        vscode.window.showInformationMessage(`✅ Fix applied: ${result.explanation}`);
+    let fixText = result.fix;
+    if (!fixText.endsWith('\n')) {
+        fixText += '\n';
+    }
+    const fixLinesCount = fixText.split(/\r?\n/).length - 1;
+    edit.insert(document.uri, new vscode.Position(lineNum + 1, 0), fixText);
+    await vscode.workspace.applyEdit(edit);
+    const changes = [{
+            originalLineNum: lineNum,
+            insertedLineNum: lineNum + 1,
+            fixLinesCount
+        }];
+    const editor = vscode.window.activeTextEditor;
+    if (editor && editor.document === document) {
+        editor.setDecorations(redBackground, [document.lineAt(lineNum).range]);
+        if (fixLinesCount > 0) {
+            const startPos = new vscode.Position(lineNum + 1, 0);
+            const endPos = new vscode.Position(lineNum + fixLinesCount - 1, Number.MAX_VALUE);
+            editor.setDecorations(greenBackground, [new vscode.Range(startPos, endPos)]);
+        }
+    }
+    playNotificationSound();
+    const action = await vscode.window.showInformationMessage('Apply this AI fix?', { modal: false }, 'Accept', 'Reject');
+    // Clear decorations regardless of choice
+    if (editor && editor.document === document) {
+        editor.setDecorations(redBackground, []);
+        editor.setDecorations(greenBackground, []);
+    }
+    if (action === 'Accept') {
+        const acceptEdit = new vscode.WorkspaceEdit();
+        for (const change of changes) {
+            acceptEdit.delete(document.uri, document.lineAt(change.originalLineNum).rangeIncludingLineBreak);
+        }
+        await vscode.workspace.applyEdit(acceptEdit);
+        if (result.envUpdate) {
+            const existingKeys = await getExistingEnvKeys(document.uri);
+            if (!existingKeys.has(result.envUpdate.key)) {
+                const envAction = await vscode.window.showInformationMessage(`SecureStack found a hardcoded secret. Extract it to a .env file automatically?`, 'Yes', 'No');
+                if (envAction === 'Yes') {
+                    await appendToEnv(document.uri, [result.envUpdate]);
+                }
+            }
+        }
+        return true;
     }
     else {
-        vscode.window.showErrorMessage('SecureStack: Failed to apply the edit.');
+        const rejectEdit = new vscode.WorkspaceEdit();
+        for (const change of changes) {
+            const start = new vscode.Position(change.insertedLineNum, 0);
+            const end = new vscode.Position(change.insertedLineNum + change.fixLinesCount, 0);
+            rejectEdit.delete(document.uri, new vscode.Range(start, end));
+        }
+        await vscode.workspace.applyEdit(rejectEdit);
+        return false;
     }
-    return success;
 }
 // ── Apply fix by URI + line number (used by hover command link) ──────────────
 async function applyFixAtPosition(uriString, lineNum, dc) {
@@ -102,14 +166,11 @@ async function applyAllFixes(document, diagnosticsCollection) {
         title: `🛡️ SecureStack: Fixing ${secDiags.length} issue(s)…`,
         cancellable: false
     }, async () => {
-        // Process highest line first so replacements don't shift earlier line numbers
         const sorted = [...secDiags].sort((a, b) => b.range.start.line - a.range.start.line);
-        // Snapshot the document ONCE before any edits touch it
         const current = vscode.workspace.textDocuments.find(d => d.uri.toString() === document.uri.toString()) ?? document;
-        // Collect ALL replacements into ONE WorkspaceEdit.
-        // A single applyEdit() = a single undo step, so Ctrl+Z reverts everything at once.
         const batchEdit = new vscode.WorkspaceEdit();
         const seenLines = new Set();
+        const changes = [];
         const envUpdates = [];
         let fixed = 0;
         for (const diag of sorted) {
@@ -126,7 +187,17 @@ async function applyAllFixes(document, diagnosticsCollection) {
                 result = (await fetchApiFix(current.getText(), diag.message, lineNum));
             }
             if (result) {
-                batchEdit.replace(current.uri, current.lineAt(lineNum).range, result.fix);
+                let fixText = result.fix;
+                if (!fixText.endsWith('\n')) {
+                    fixText += '\n';
+                }
+                const fixLinesCount = fixText.split(/\r?\n/).length - 1;
+                batchEdit.insert(current.uri, new vscode.Position(lineNum + 1, 0), fixText);
+                changes.push({
+                    originalLineNum: lineNum,
+                    insertedLineNum: lineNum + 1,
+                    fixLinesCount
+                });
                 if (result.envUpdate) {
                     envUpdates.push(result.envUpdate);
                 }
@@ -134,24 +205,86 @@ async function applyAllFixes(document, diagnosticsCollection) {
                 fixed++;
             }
         }
-        if (envUpdates.length > 0) {
-            const action = await vscode.window.showInformationMessage(`SecureStack found ${envUpdates.length} hardcoded secret(s). Extract them to a .env file automatically?`, 'Yes', 'No');
-            if (action !== 'Yes') {
-                return; // Cancel the entire batch if user says no
-            }
-            await appendToEnv(document.uri, envUpdates);
-        }
         if (fixed > 0) {
-            const success = await vscode.workspace.applyEdit(batchEdit);
-            if (!success) {
-                vscode.window.showErrorMessage('SecureStack: Failed to apply batch edit.');
-                return;
+            await vscode.workspace.applyEdit(batchEdit);
+            changes.reverse();
+            const editor = vscode.window.activeTextEditor;
+            if (editor && editor.document === current) {
+                const redRanges = changes.map(c => current.lineAt(c.originalLineNum).range);
+                const greenRanges = changes.map(c => {
+                    if (c.fixLinesCount > 0) {
+                        const start = new vscode.Position(c.insertedLineNum, 0);
+                        const end = new vscode.Position(c.insertedLineNum + c.fixLinesCount - 1, Number.MAX_VALUE);
+                        return new vscode.Range(start, end);
+                    }
+                    return null;
+                }).filter((r) => r !== null);
+                editor.setDecorations(redBackground, redRanges);
+                editor.setDecorations(greenBackground, greenRanges);
+            }
+            playNotificationSound();
+            const action = await vscode.window.showInformationMessage(`Apply ${fixed} AI fix(es)?`, { modal: false }, 'Accept All', 'Reject All');
+            if (editor && editor.document === current) {
+                editor.setDecorations(redBackground, []);
+                editor.setDecorations(greenBackground, []);
+            }
+            if (action === 'Accept All') {
+                const acceptEdit = new vscode.WorkspaceEdit();
+                const sortedDesc = [...changes].sort((a, b) => b.originalLineNum - a.originalLineNum);
+                for (const change of sortedDesc) {
+                    acceptEdit.delete(document.uri, document.lineAt(change.originalLineNum).rangeIncludingLineBreak);
+                }
+                await vscode.workspace.applyEdit(acceptEdit);
+                if (envUpdates.length > 0) {
+                    const existingKeys = await getExistingEnvKeys(document.uri);
+                    const newUpdates = envUpdates.filter(u => !existingKeys.has(u.key));
+                    if (newUpdates.length > 0) {
+                        const envAction = await vscode.window.showInformationMessage(`SecureStack found ${newUpdates.length} hardcoded secret(s). Extract them to a .env file automatically?`, 'Yes', 'No');
+                        if (envAction === 'Yes') {
+                            await appendToEnv(document.uri, newUpdates);
+                        }
+                    }
+                }
+            }
+            else {
+                const rejectEdit = new vscode.WorkspaceEdit();
+                const sortedDesc = [...changes].sort((a, b) => b.insertedLineNum - a.insertedLineNum);
+                for (const change of sortedDesc) {
+                    const start = new vscode.Position(change.insertedLineNum, 0);
+                    const end = new vscode.Position(change.insertedLineNum + change.fixLinesCount, 0);
+                    rejectEdit.delete(document.uri, new vscode.Range(start, end));
+                }
+                await vscode.workspace.applyEdit(rejectEdit);
             }
         }
-        vscode.window.showInformationMessage(`✅ SecureStack: ${fixed}/${secDiags.length} issue(s) fixed.`);
     });
 }
 // ── Environment Helpers ──────────────────────────────────────────────────────
+async function getExistingEnvKeys(documentUri) {
+    const keys = new Set();
+    const workspaceFolder = vscode.workspace.getWorkspaceFolder(documentUri);
+    if (!workspaceFolder) {
+        return keys;
+    }
+    const envPath = vscode.Uri.joinPath(workspaceFolder.uri, '.env');
+    try {
+        const data = await vscode.workspace.fs.readFile(envPath);
+        const content = Buffer.from(data).toString('utf-8');
+        for (const line of content.split(/\r?\n/)) {
+            const trimmed = line.trim();
+            if (trimmed && !trimmed.startsWith('#')) {
+                const eqIdx = trimmed.indexOf('=');
+                if (eqIdx > 0) {
+                    keys.add(trimmed.substring(0, eqIdx).trim());
+                }
+            }
+        }
+    }
+    catch {
+        // File doesn't exist yet
+    }
+    return keys;
+}
 async function appendToEnv(documentUri, updates) {
     const workspaceFolder = vscode.workspace.getWorkspaceFolder(documentUri);
     if (!workspaceFolder) {
