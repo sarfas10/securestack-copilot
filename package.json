@@ -2,7 +2,18 @@
   "name": "ai-security-copilot",
   "displayName": "SecureStack Copilot",
   "description": "Detects security vulnerabilities and provides AI-powered fixes.",
-  "version": "1.1.0",
+  "publisher": "securestack",
+  "icon": "images/icon.png",
+  "license": "MIT",
+  "galleryBanner": {
+    "color": "#1e1e2e",
+    "theme": "dark"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sarfas10/securestack-copilot"
+  },
+  "version": "1.1.1",
   "engines": {
     "vscode": "^1.80.0"
   },
@@ -11,8 +22,8 @@
     "Other"
   ],
   "activationEvents": [
-    "*"
-  ],
+  "onStartupFinished"
+],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
@@ -43,4 +54,5 @@
     "@types/node": "18.x",
     "typescript": "^5.1.3"
   }
+  
 }

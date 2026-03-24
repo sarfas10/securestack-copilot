@@ -111,7 +111,7 @@ export async function applySecurityFix(
     editor = vscode.window.activeTextEditor;
     if (editor && editor.document === document) {
         editor.setDecorations(redBackground, [document.lineAt(lineNum).range]);
-        
+
         if (fixLinesCount > 0) {
             const startPos = new vscode.Position(lineNum + 1, 0);
             const endPos = new vscode.Position(lineNum + fixLinesCount - 1, Number.MAX_VALUE);
@@ -146,7 +146,7 @@ export async function applySecurityFix(
             );
         }
         await vscode.workspace.applyEdit(finalEdit);
-        
+
         if (result.envUpdate) {
             const existingKeys = await getExistingEnvKeys(document.uri);
             if (!existingKeys.has(result.envUpdate.key)) {
