@@ -2,7 +2,7 @@
   "name": "ai-security-copilot",
   "displayName": "SecureStack Copilot",
   "description": "Detects security vulnerabilities and provides AI-powered fixes.",
-  "publisher": "securestack",
+  "publisher": "SecureStack",
   "icon": "images/icon.png",
   "license": "MIT",
   "galleryBanner": {
