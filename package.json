@@ -13,7 +13,7 @@
     "type": "git",
     "url": "https://github.com/sarfas10/securestack-copilot"
   },
-  "version": "1.1.1",
+  "version": "1.1.2",
   "engines": {
     "vscode": "^1.80.0"
   },
@@ -22,8 +22,8 @@
     "Other"
   ],
   "activationEvents": [
-  "onStartupFinished"
-],
+    "onStartupFinished"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
@@ -61,5 +61,4 @@
     "@types/node": "18.x",
     "typescript": "^5.1.3"
   }
-  
 }
