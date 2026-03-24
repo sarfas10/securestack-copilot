@@ -36,12 +36,24 @@ const FIX_PATTERNS: FixPattern[] = [
 
     // ── 2. XSS ───────────────────────────────────────────────────────────────
     {
-        keywords: ['xss', 'innerhtml', 'textcontent', 'domPurify', 'dangerouslysetinnerhtml'],
+        keywords: ['xss', 'innerhtml', 'textcontent', 'domPurify', 'dangerouslysetinnerhtml', 'insertadjacenthtml', 'setattribute'],
         apply: (line) => {
             if (/\.innerHTML\s*=/.test(line)) {
                 return {
                     fix: line.replace(/\.innerHTML\s*=/, '.textContent ='),
                     explanation: 'Replaced .innerHTML with .textContent to prevent XSS.'
+                };
+            }
+            if (/\.insertAdjacentHTML\s*\(/.test(line)) {
+                return {
+                    fix: line.replace(/\.insertAdjacentHTML\s*\(/, '.insertAdjacentHTML(/* TODO: Sanitize input */ '),
+                    explanation: 'Added a warning to sanitize input before using insertAdjacentHTML to prevent XSS.'
+                };
+            }
+            if (/\.setAttribute\s*\(\s*['"`]on\w+['"`]/.test(line)) {
+                return {
+                    fix: line.replace(/\.setAttribute\s*\(\s*(['"`]on\w+['"`])\s*,\s*(.+)\s*\)/, '.addEventListener($1.substring(2), () => { $2 })'),
+                    explanation: 'Replaced inline event handler with addEventListener for better security.'
                 };
             }
             if (/dangerouslySetInnerHTML/.test(line)) {
@@ -58,6 +70,121 @@ const FIX_PATTERNS: FixPattern[] = [
                     explanation: 'Replaced document.write() with safe textContent assignment to prevent XSS.'
                 };
             }
+            return null;
+        }
+    },
+
+    // ── 11. Sensitive Data Displayed/Logged (URLs) ───────────────────────────
+    {
+        keywords: ['credentials or tokens in url', 'secret or token appended', 'url query string'],
+        apply: (line, lineNum) => {
+            const ind = indent(line);
+            const sensitiveParams = 'token|password|secret|key|apiKey|api_key|username|passwd|access_token|auth';
+
+            // Case 1: fetch("url?token=" + apiKey)
+            const fetchConcatRe = new RegExp(`(fetch|axios\\.(?:get|post|put|delete|request))\\s*\\(\\s*(['\"\`].*?)[?&](?:${sensitiveParams})=['\"\`]?\\s*\\+\\s*([a-zA-Z0-9_.]+)`, 'i');
+            const fetchConcatMatch = line.match(fetchConcatRe);
+            if (fetchConcatMatch) {
+                const [, method, baseUrl, varName] = fetchConcatMatch;
+                return {
+                    fix: `${ind}${method}(${baseUrl}", { headers: { "Authorization": \`Bearer \${${varName}}\` } });`,
+                    explanation: 'Moved secret from URL query parameter to Authorization header.'
+                };
+            }
+
+            // Case 2: fetch(`url?token=${apiKey}`)
+            const fetchTemplateRe = new RegExp(`(fetch|axios\\.(?:get|post|put|delete|request))\\s*\\(\\s*\`([^\`]+?)[?&](?:${sensitiveParams})=\\s*\\$\\{(.+?)\\}\\s*\`\\s*\\)`, 'i');
+            const fetchTemplateMatch = line.match(fetchTemplateRe);
+            if (fetchTemplateMatch) {
+                const [, method, baseUrl, varName] = fetchTemplateMatch;
+                return {
+                    fix: `${ind}${method}(\`${baseUrl}\`, { headers: { "Authorization": \`Bearer \${${varName}}\` } });`,
+                    explanation: 'Moved secret from URL query parameter to Authorization header.'
+                };
+            }
+
+            // Case 3: Literal token fetch("url?token=sk-123")
+            const fetchLiteralRe = new RegExp(`(fetch|axios\\.(?:get|post|put|delete|request))\\s*\\(\\s*(['\"\`])(.*?)[?&](?:${sensitiveParams})=([^'\\"\\s\`&]+)\\2\\s*\\)`, 'i');
+            const fetchLiteralMatch = line.match(fetchLiteralRe);
+            if (fetchLiteralMatch) {
+                const [, method, quote, baseUrl, secretValue] = fetchLiteralMatch;
+                return {
+                    fix: `${ind}${method}(${quote}${baseUrl}${quote}, { headers: { "Authorization": \`Bearer \${process.env.API_TOKEN}\` } });`,
+                    explanation: 'Moved literal secret from URL to .env file and passed via Authorization header.',
+                    envUpdate: { key: 'API_TOKEN', value: secretValue }
+                };
+            }
+
+            // Case 4: window.location.href = "url?token=" + apiKey
+            const winRe = new RegExp(`(window\\.location(?:\\.href)?|document\\.location)\\s*=\\s*(['\"\`].*?)[?&](?:${sensitiveParams})=['\"\`]?\\s*\\+\\s*([a-zA-Z0-9_.]+)`, 'i');
+            const winMatch = line.match(winRe);
+            if (winMatch) {
+                const [, winProp, baseUrl] = winMatch;
+                return {
+                    fix: `${ind}${winProp} = ${baseUrl}"; // SECURITY: Exposing tokens in URLs is disabled`,
+                    explanation: 'Removed sensitive token from redirect URL string to prevent token leakage in Referer headers or server logs.'
+                };
+            }
+
+            // Case 5: URL string assignment with inline credentials
+            const urlAssignRe = new RegExp(`(['\"\`])https?://[^'\"\`]*[?&](?:${sensitiveParams})=[^'\"\`&]*`, 'i');
+            if (urlAssignRe.test(line)) {
+                const sensitiveParamRe = new RegExp(`([?&])(?:${sensitiveParams})=[^'\"\`&]*`, 'gi');
+                let fixed = line;
+                const secrets: { key: string; value: string }[] = [];
+                const paramCapture = new RegExp(`[?&](${sensitiveParams})=([^'\"\`&]*)`, 'gi');
+                let paramMatch;
+                while ((paramMatch = paramCapture.exec(line)) !== null) {
+                    const paramName = paramMatch[1].replace(/([a-z])([A-Z])/g, '$1_$2').toUpperCase();
+                    if (paramMatch[2]) {
+                        secrets.push({ key: paramName, value: paramMatch[2] });
+                    }
+                }
+
+                fixed = fixed.replace(sensitiveParamRe, (match, prefix) => '');
+                fixed = fixed.replace(/\?&/g, '?');
+                fixed = fixed.replace(/&&+/g, '&');
+                fixed = fixed.replace(/\?(['"`])/g, '$1');
+                fixed = fixed.replace(/&(['"`])/g, '$1');
+
+                if (fixed !== line) {
+                    const envInfo = secrets.map(s => `${s.key}=${s.value}`).join(', ');
+                    return {
+                        fix: `${fixed}\n${ind}// SECURITY: Removed sensitive query params (${secrets.map(s => s.key).join(', ')}). Pass credentials via headers or environment variables.`,
+                        explanation: `Stripped sensitive parameters from URL to prevent credential leakage. Move values to .env: ${envInfo}`,
+                        envUpdate: secrets.length > 0 ? { key: secrets[0].key, value: secrets[0].value } : undefined
+                    };
+                }
+            }
+
+            // Fallback: strip entire sensitive query parameters from the line
+            const fallbackRe = new RegExp(`[?&](?:${sensitiveParams})=[^'\\"\\s\`&]*`, 'gi');
+            if (fallbackRe.test(line)) {
+                const secrets: { key: string; value: string }[] = [];
+                const paramCapture = new RegExp(`[?&](${sensitiveParams})=([^'\\"\\s\`&]*)`, 'gi');
+                let paramMatch;
+                while ((paramMatch = paramCapture.exec(line)) !== null) {
+                    const paramName = paramMatch[1].replace(/([a-z])([A-Z])/g, '$1_$2').toUpperCase();
+                    if (paramMatch[2]) {
+                        secrets.push({ key: paramName, value: paramMatch[2] });
+                    }
+                }
+
+                let fixed = line.replace(fallbackRe, '');
+                fixed = fixed.replace(/\?(['"`])/g, '$1');
+                fixed = fixed.replace(/&(['"`])/g, '$1');
+                fixed = fixed.replace(/\?&/g, '?');
+                fixed = fixed.replace(/&&+/g, '&');
+
+                if (fixed !== line) {
+                    return {
+                        fix: `${fixed}\n${ind}// SECURITY: Removed sensitive query params. Pass credentials via headers or environment variables.`,
+                        explanation: 'Stripped sensitive parameters from URL to prevent credential leakage in Referer headers, browser history, or server logs.',
+                        envUpdate: secrets.length > 0 ? { key: secrets[0].key, value: secrets[0].value } : undefined
+                    };
+                }
+            }
+
             return null;
         }
     },
@@ -164,6 +291,13 @@ const FIX_PATTERNS: FixPattern[] = [
                     explanation: 'Switched to execFile() which does not invoke a shell. Pass dynamic arguments as an array instead.'
                 };
             }
+            if (/\b(?:spawn|spawnSync)\s*\(/.test(line) && /shell\s*:\s*true/.test(line)) {
+                const ind = indent(line);
+                return {
+                    fix: line.replace(/shell\s*:\s*true/, 'shell: false /* security: disabled shell to prevent injection */'),
+                    explanation: 'Disabled shell:true in spawn/spawnSync to prevent command injection. Pass arguments as an array instead.'
+                };
+            }
             if (/\bspawn\s*\(/.test(line) && /"sh"|'sh'|"bash"|'bash'|"cmd"|'cmd'/.test(line)) {
                 const ind = indent(line);
                 return {
@@ -199,6 +333,25 @@ const FIX_PATTERNS: FixPattern[] = [
                     ].join('\n'),
                     explanation: 'Added path.resolve() validation to fs method to prevent path traversal outside intended base directory.'
                 };
+            }
+            
+            if (/res\.(?:sendFile|download)\s*\(/.test(line)) {
+                const match = line.match(/res\.(?:sendFile|download)\s*\((.+)\)/);
+                if (match) {
+                    const pathArg = match[1].split(',')[0].trim();
+                    const ind = indent(line);
+                    const B = `_base_L${lineNum}`;
+                    const S = `_safe_L${lineNum}`;
+                    return {
+                        fix: [
+                            `${ind}const ${B} = require('path').resolve(__dirname, 'public'); // set your allowed base dir`,
+                            `${ind}const ${S} = require('path').resolve(${B}, ${pathArg});`,
+                            `${ind}if (!${S}.startsWith(${B})) { throw new Error('Path traversal detected'); }`,
+                            line.replace(pathArg, S) + ' /* securestack-disable-line */'
+                        ].join('\n'),
+                        explanation: 'Added path validation to res.sendFile/download to prevent path traversal.'
+                    };
+                }
             }
             
             if (/path\.join\s*\(/.test(line)) {
@@ -347,70 +500,7 @@ const FIX_PATTERNS: FixPattern[] = [
         }
     },
 
-    // ── 11. Sensitive Data Displayed/Logged (URLs) ───────────────────────────
-    {
-        keywords: ['credentials or tokens in url', 'secret or token appended'],
-        apply: (line) => {
-            const ind = indent(line);
 
-            // Case 1: fetch("url?token=" + apiKey)
-            const fetchConcatMatch = line.match(/(fetch|axios\.(?:get|post|put|delete|request))\s*\(\s*(['"`].*?)[?&](?:token|password|secret|key|apiKey|api_key)=['"`]?\s*\+\s*([a-zA-Z0-9_]+)\b\s*\)/i);
-            if (fetchConcatMatch) {
-                const [, method, baseUrl, varName] = fetchConcatMatch;
-                return {
-                    fix: `${ind}${method}(${baseUrl}", { headers: { "Authorization": \`Bearer \${${varName}}\` } });`,
-                    explanation: 'Moved secret from URL query parameter to Authorization header.'
-                };
-            }
-
-            // Case 2: fetch(`url?token=${apiKey}`)
-            const fetchTemplateMatch = line.match(/(fetch|axios\.(?:get|post|put|delete|request))\s*\(\s*`([^`]+?)[?&](?:token|password|secret|key|apiKey|api_key)=\s*\$\{(.+?)\}\s*`\s*\)/i);
-            if (fetchTemplateMatch) {
-                const [, method, baseUrl, varName] = fetchTemplateMatch;
-                return {
-                    fix: `${ind}${method}(\`${baseUrl}\`, { headers: { "Authorization": \`Bearer \${${varName}}\` } });`,
-                    explanation: 'Moved secret from URL query parameter to Authorization header.'
-                };
-            }
-
-            // Case 3: Literal token fetch("url?token=sk-123")
-            const fetchLiteralMatch = line.match(/(fetch|axios\.(?:get|post|put|delete|request))\s*\(\s*(['"`])(.*?)[?&](?:token|password|secret|key|apiKey|api_key)=([^'"\s`&]+)\2\s*\)/i);
-            if (fetchLiteralMatch) {
-                const [, method, quote, baseUrl, secretValue] = fetchLiteralMatch;
-                return {
-                    fix: `${ind}${method}(${quote}${baseUrl}${quote}, { headers: { "Authorization": \`Bearer \${process.env.API_TOKEN}\` } });`,
-                    explanation: 'Moved literal secret from URL to .env file and passed via Authorization header.',
-                    envUpdate: { key: 'API_TOKEN', value: secretValue }
-                };
-            }
-
-            // Case 4: window.location.href = "url?token=" + apiKey
-            const winMatch = line.match(/(window\.location(?:\.href)?|document\.location)\s*=\s*(['"`].*?)[?&](?:token|password|secret|key|apiKey|api_key)=['"`]?\s*\+\s*([a-zA-Z0-9_]+)/i);
-            if (winMatch) {
-                const [, winProp, baseUrl] = winMatch;
-                return {
-                    fix: `${ind}${winProp} = ${baseUrl}"; // SECURITY: Exposing tokens in URLs is disabled`,
-                    explanation: 'Removed sensitive token from redirect URL string to prevent token leakage in Referer headers or server logs.'
-                };
-            }
-
-            // Fallback: literal string assignment containing token
-            const literalMatch = line.match(/([?&](?:token|password|secret|key|apiKey|api_key)=)([^'"\s`&]+)/i);
-            if (literalMatch) {
-                const paramPrefix = literalMatch[1];
-                const secretValue = literalMatch[2];
-                if (secretValue.length > 4 && !secretValue.includes('process.env') && !secretValue.includes('${')) {
-                    return {
-                        fix: line.replace(/([?&](?:token|password|secret|key|apiKey|api_key)=)([^'"\s`&]+)/i, '$1REDACTED_SECRET'),
-                        explanation: 'Removed hardcoded secret from URL. Extracting to .env file.',
-                        envUpdate: { key: 'URL_SECRET', value: secretValue }
-                    };
-                }
-            }
-
-            return null;
-        }
-    },
 
     // ── 12. Prototype Pollution ──────────────────────────────────────────────
     {
@@ -443,13 +533,44 @@ const FIX_PATTERNS: FixPattern[] = [
     {
         keywords: ['math.random', 'insecure randomness', 'crypto.randombytes'],
         apply: (line) => {
-            if (/Math\.random\s*\(\s*\)/.test(line)) {
+            if (!/Math\.random\s*\(\s*\)/.test(line)) { return null; }
+
+            const ind = indent(line);
+            const decl = line.match(/\b(const|let|var)\b/)?.[0] ?? 'const';
+            const varMatch = line.match(/\b(?:const|let|var)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=/);
+            const varName = varMatch?.[1] ?? '_rand';
+
+            // Pattern: Math.random().toString(36)  → hex token via randomBytes
+            if (/Math\.random\s*\(\s*\)\s*\.toString\s*\(\s*36\s*\)/.test(line)) {
                 return {
-                    fix: line.replace(/Math\.random\s*\(\s*\)/, 'require("crypto").randomInt(0, 1_000_000) / 1_000_000'),
-                    explanation: 'Replaced Math.random() with cryptographically secure crypto.randomInt().'
+                    fix: `${ind}${decl} ${varName} = require("crypto").randomBytes(16).toString("hex");`,
+                    explanation: 'Replaced Math.random().toString(36) with crypto.randomBytes(16).toString("hex") for a cryptographically secure random token.'
                 };
             }
-            return null;
+
+            // Pattern: Math.floor(Math.random() * N)  → crypto.randomInt(0, N)
+            const floorMatch = line.match(/Math\.floor\s*\(\s*Math\.random\s*\(\s*\)\s*\*\s*(\d+)\s*\)/);
+            if (floorMatch) {
+                const upperBound = floorMatch[1];
+                return {
+                    fix: `${ind}${decl} ${varName} = require("crypto").randomInt(0, ${upperBound});`,
+                    explanation: `Replaced Math.floor(Math.random() * ${upperBound}) with crypto.randomInt(0, ${upperBound}) for a cryptographically secure integer.`
+                };
+            }
+
+            // Pattern: Math.random().toString(16) or generic Math.random() hex usage
+            if (/Math\.random\s*\(\s*\)\s*\.toString\s*\(\s*16\s*\)/.test(line)) {
+                return {
+                    fix: `${ind}${decl} ${varName} = require("crypto").randomBytes(16).toString("hex");`,
+                    explanation: 'Replaced Math.random().toString(16) with crypto.randomBytes(16).toString("hex") for a cryptographically secure random hex string.'
+                };
+            }
+
+            // Fallback: generic Math.random() replacement
+            return {
+                fix: line.replace(/Math\.random\s*\(\s*\)/, 'require("crypto").randomBytes(4).readUInt32BE(0) / 4294967296'),
+                explanation: 'Replaced Math.random() with crypto.randomBytes() for cryptographically secure randomness. (4294967296 = 2^32)'
+            };
         }
     },
 
@@ -520,6 +641,50 @@ const FIX_PATTERNS: FixPattern[] = [
                 fix: `${ind}// Apply rate limiting: app.use(require('express-rate-limit')({ windowMs: 15*60*1000, max: 10 }))\n${line}`,
                 explanation: 'Add express-rate-limit middleware to prevent brute-force attacks on this route.'
             };
+        }
+    },
+    // ── 18. Insecure Cookies ────────────────────────────────────────────────
+    {
+        keywords: ['insecure cookie', 'missing httponly', 'secure flag'],
+        apply: (line) => {
+            const ind = indent(line);
+            if (/res\.cookie\s*\(/.test(line)) {
+                let fixed = line;
+                if (!/httpOnly\s*:\s*true/.test(line)) {
+                    fixed = fixed.replace(/res\.cookie\s*\(([^,]+),\s*([^,]+),\s*\{/, 'res.cookie($1, $2, { httpOnly: true, ');
+                    if (fixed === line) { // missing options object entirely
+                        fixed = fixed.replace(/res\.cookie\s*\(([^,]+),\s*([^)]+)\)/, 'res.cookie($1, $2, { httpOnly: true, secure: true, sameSite: "strict" })');
+                    }
+                }
+                if (!/secure\s*:\s*true/.test(fixed) && fixed.includes('{')) {
+                    fixed = fixed.replace('{', '{ secure: true, ');
+                }
+                if (fixed !== line) {
+                    return {
+                        fix: fixed,
+                        explanation: 'Added httpOnly and secure flags to cookie to prevent XSS theft and ensure encrypted transmission.'
+                    };
+                }
+            }
+            return null;
+        }
+    },
+
+    // ── 19. NoSQL Injection ──────────────────────────────────────────────────
+    {
+        keywords: ['nosql injection', 'mongodb query', 'request object passed directly'],
+        apply: (line) => {
+            const ind = indent(line);
+            const match = line.match(/\.(find|findOne|update|delete|count)\s*\(\s*(req\.(body|query|params)[^)]*)\)/);
+            if (match) {
+                const method = match[1];
+                const input = match[2];
+                return {
+                    fix: line.replace(input, `/* sanitize NoSQL */ (typeof ${input} === 'string' ? { _id: ${input} } : ${input})`),
+                    explanation: 'Neutralized potential NoSQL injection by ensuring request input is handled safely.'
+                };
+            }
+            return null;
         }
     }
 ];

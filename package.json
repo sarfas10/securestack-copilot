@@ -34,6 +34,13 @@
       }
     ],
     "menus": {
+      "editor/title": [
+        {
+          "command": "aiSecurityCopilot.fixAllInFile",
+          "group": "navigation",
+          "when": "editorFocus"
+        }
+      ],
       "editor/context": [
         {
           "command": "aiSecurityCopilot.fixAllInFile",

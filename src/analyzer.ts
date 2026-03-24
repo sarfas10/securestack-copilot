@@ -36,6 +36,12 @@ export function analyzeCode(code: string): Issue[] {
         if (/\.innerHTML\s*=/.test(line) && !/\.innerHTML\s*=\s*['"` ][^'"` ]*['"` ]\s*;/.test(line)) {
             push(issues, i, "XSS: Dynamic value assigned to innerHTML. Use textContent or sanitize with DOMPurify.", 'critical');
         }
+        if (/\.insertAdjacentHTML\s*\(/.test(line) && !/\.insertAdjacentHTML\s*\([^,]+,\s*['"` ][^'"` ]*['"` ]\s*\)/.test(line)) {
+            push(issues, i, "XSS: Dynamic value passed to insertAdjacentHTML. Sanitize input before insertion.", 'critical');
+        }
+        if (/\.setAttribute\s*\(\s*['"` ]on\w+['"` ]/.test(line)) {
+            push(issues, i, "XSS: Direct assignment of event handlers via setAttribute can enable script injection.", 'warning');
+        }
         if (/dangerouslySetInnerHTML/.test(line)) {
             push(issues, i, "XSS: dangerouslySetInnerHTML detected. Ensure value is sanitized.", 'critical');
         }
@@ -71,11 +77,21 @@ export function analyzeCode(code: string): Issue[] {
             /\b(?:exec|execSync)\s*\(\s*`[^`]*\$\{/.test(line)) {
             push(issues, i, "Command Injection: Shell command built with concatenated or interpolated string. Use execFile() with an args array.", 'critical');
         }
+        if (/\b(?:spawn|spawnSync)\s*\(/.test(line) && /shell\s*:\s*true/.test(line)) {
+            if (!/\b(?:spawn|spawnSync)\s*\(\s*['"` ][^'"` ]+['"` ]\s*,/.test(line)) {
+                push(issues, i, "Command Injection: spawn/spawnSync with shell:true and dynamic input is risky. Pass arguments as an array instead.", 'critical');
+            }
+        }
 
         // ── 6. PATH TRAVERSAL ─────────────────────────────────────────────────
         if (/\bfs\.(readFile|readFileSync|writeFile|writeFileSync|appendFile|createReadStream)\s*\(/.test(line) &&
             /(\+\s*\w|\$\{|req\.|params\.|query\.|body\.)/.test(line)) {
             push(issues, i, "Path Traversal: File path built from dynamic input. Use path.resolve() and validate against an allowed base directory.", 'critical');
+        }
+        if (/res\.(?:sendFile|download)\s*\(/.test(line)) {
+            if (!/res\.(?:sendFile|download)\s*\(\s*['"` ][^'"` ]+['"` ]\s*[,)]/.test(line)) {
+                push(issues, i, "Path Traversal: res.sendFile/download with user-controlled input. Validate paths to prevent unauthorized file access.", 'critical');
+            }
         }
         if (/path\.join\s*\(/.test(line) && /(\+\s*\w|\$\{|req\.|params\.|query\.|body\.)/.test(line)) {
             push(issues, i, "Path Traversal: path.join with user-controlled input. Validate the resolved path is within the intended directory.", 'warning');
@@ -126,10 +142,10 @@ export function analyzeCode(code: string): Issue[] {
         }
 
         // ── 11. SENSITIVE DATA IN URLS ────────────────────────────────────────
-        if (/['"` ]https?:\/\/[^'"` ]*[?&](?:password|token|secret|apiKey|api_key|key)=/i.test(line)) {
+        if (/['"`]https?:\/\/[^'"`]*[?&](?:password|token|secret|apiKey|api_key|key|username|passwd|access_token|auth)=/i.test(line)) {
             push(issues, i, "Sensitive Data Exposure: Credentials or tokens in URL query string. Use HTTP headers (Authorization) instead.", 'warning');
         }
-        if (/(?:fetch|window\.location\.href|axios)\s*\([^)]*\+\s*(?:token|apiKey|secret|password)\b/.test(line)) {
+        if (/(?:fetch|window\.location\.href|axios)\s*\([^)]*\+\s*(?:token|apiKey|secret|password|username|access_token)\b/.test(line)) {
             push(issues, i, "Sensitive Data Exposure: Secret or token appended to URL. Use Authorization headers instead of query parameters.", 'warning');
         }
 
@@ -171,6 +187,16 @@ export function analyzeCode(code: string): Issue[] {
         if (/app\.(post|put|delete|patch)\s*\(/.test(line) &&
             !/csrf|csrfToken|csurf|xsrf/i.test(line)) {
             push(issues, i, "CSRF: Mutating route without CSRF protection detected. Use csurf or equivalent.", 'info');
+        }
+
+        // ── MISC: INSECURE COOKIES ────────────────────────────────────────────
+        if (/res\.cookie\s*\(/.test(line) && (!/httpOnly\s*:\s*true/.test(line) || !/secure\s*:\s*true/.test(line))) {
+            push(issues, i, "Insecure Cookie: Cookie missing httpOnly:true or secure:true flags. This increases risk of XSS-based cookie theft.", 'warning');
+        }
+
+        // ── MISC: NOSQL INJECTION ─────────────────────────────────────────────
+        if (/\.(find|findOne|update|delete|count)\s*\(\s*req\.(body|query|params)/.test(line)) {
+            push(issues, i, "NoSQL Injection: Express request object passed directly into MongoDB query. This can lead to unauthorized data access.", 'critical');
         }
     }
 
