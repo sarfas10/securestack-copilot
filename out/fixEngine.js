@@ -25,7 +25,7 @@ const FIX_PATTERNS = [
     },
     // ── 2. XSS ───────────────────────────────────────────────────────────────
     {
-        keywords: ['xss', 'innerhtml', 'textcontent', 'domPurify', 'dangerouslysetinnerhtml', 'insertadjacenthtml', 'setattribute'],
+        keywords: ['xss', 'innerhtml', 'textcontent', 'domPurify', 'dangerouslysetinnerhtml', 'insertadjacenthtml', 'setattribute', 'outputted to page'],
         apply: (line) => {
             if (/\.innerHTML\s*=/.test(line)) {
                 return {
@@ -58,6 +58,18 @@ const FIX_PATTERNS = [
                     fix: `${ind}document.getElementById('output').textContent = ${arg};`,
                     explanation: 'Replaced document.write() with safe textContent assignment to prevent XSS.'
                 };
+            }
+            if (/(?:echo|print|response\.write|out\.print)/i.test(line)) {
+                const ind = indent(line);
+                const callMatch = line.match(/(?:echo|print|response\.write|out\.print)\s*\(?\s*(.+?)\s*\)?\s*;?$/i);
+                if (callMatch) {
+                    const arg = callMatch[1];
+                    const method = line.match(/(echo|print|response\.write|out\.print)/i)?.[0] ?? 'echo';
+                    return {
+                        fix: `${ind}${method}(escapeHtml(${arg})); /* TODO: ensure escapeHtml is defined */`,
+                        explanation: 'Wrapped output in escapeHtml() to prevent XSS. Ensure you have a sanitization helper defined in your project.'
+                    };
+                }
             }
             return null;
         }
@@ -397,13 +409,12 @@ const FIX_PATTERNS = [
             }
             return {
                 fix: [
-                    `${ind}// SSRF guard: validate the URL hostname before making this request`,
-                    `${ind}// const ${P} = new URL(urlVariable);`,
-                    `${ind}// const ${A} = ['api.example.com'];`,
-                    `${ind}// if (!${A}.includes(${P}.hostname)) { throw new Error('SSRF: host not allowed'); }`,
+                    `${ind}const ${P} = new URL(${line.trim().match(/['"`](.*?)['"`]/)?.[1] || 'url_variable'});`,
+                    `${ind}const ${A} = ['api.example.com']; // update with your trusted hosts`,
+                    `${ind}if (!${A}.includes(${P}.hostname)) { throw new Error('SSRF: host not allowed'); }`,
                     `${line} /* securestack-disable-line */`
                 ].join('\n'),
-                explanation: 'Added SSRF guard comment.'
+                explanation: 'Implemented SSRF hostname allowlist validation.'
             };
         }
     },
@@ -625,13 +636,126 @@ const FIX_PATTERNS = [
         keywords: ['nosql injection', 'mongodb query', 'request object passed directly'],
         apply: (line) => {
             const ind = indent(line);
-            const match = line.match(/\.(find|findOne|update|delete|count)\s*\(\s*(req\.(body|query|params)[^)]*)\)/);
+            const match = line.match(/\.(find|findOne|update|delete|count|aggregate)\s*\(\s*(req\.(body|query|params)[^)]*)\)/);
             if (match) {
-                const method = match[1];
                 const input = match[2];
                 return {
                     fix: line.replace(input, `/* sanitize NoSQL */ (typeof ${input} === 'string' ? { _id: ${input} } : ${input})`),
                     explanation: 'Neutralized potential NoSQL injection by ensuring request input is handled safely.'
+                };
+            }
+            return null;
+        }
+    },
+    // ── 20. Authentication Bypass ────────────────────────────────────────────
+    {
+        keywords: ['authentication bypass', 'identity spoofing', 'untrusted headers', 'hardcoded admin roles'],
+        apply: (line) => {
+            const ind = indent(line);
+            if (/(?:setLoginName|setAccessLevel|setAttribute|setUser|setRole)\s*\(\s*['"`](?:admin|root|superuser)['"`]\s*\)/i.test(line)) {
+                const method = line.match(/(setLoginName|setAccessLevel|setAttribute|setUser|setRole)/i)?.[0] ?? 'setRole';
+                return {
+                    fix: `${ind}if (req.session && req.session.isAdmin) {\n${ind}    ${method}('admin');\n${ind}} else {\n${ind}    throw new Error('Unauthorized role assignment attempt');\n${ind}}`,
+                    explanation: 'Replaced hardcoded privileged role assignment with a session-based check. Ensure req.session.isAdmin is verified server-side.'
+                };
+            }
+            if (/(?:getHeader|req\.headers\[['"`]|req\.header\()\s*['"`]X-.*?(?:Key|NoAuto|Role|User|Token|Secret|Admin)['"`]/i.test(line)) {
+                return {
+                    fix: `${ind}const userContext = await authProvider.verify(req.headers); // Use a trusted auth provider\n${ind}if (!userContext || !userContext.isValid) { throw new Error('Invalid authentication context'); }`,
+                    explanation: 'Replaced direct header access with a call to an authentication provider to prevent identity spoofing via untrusted headers.'
+                };
+            }
+            return null;
+        }
+    },
+    // ── 21. XXE (XML External Entity) ────────────────────────────────────────
+    {
+        keywords: ['xxe', 'insecure xml parser', 'external entity'],
+        apply: (line) => {
+            if (/noent\s*:\s*true/i.test(line)) {
+                return {
+                    fix: line.replace(/noent\s*:\s*true/i, 'noent: false /* security: disabled external entities */'),
+                    explanation: 'Disabled external entity resolution (noent: false) to prevent XXE attacks.'
+                };
+            }
+            if (/XmlReader\.Create|XmlDocument\.Load/i.test(line)) {
+                const ind = indent(line);
+                return {
+                    fix: `${ind}XmlReaderSettings settings = new XmlReaderSettings();\n${ind}settings.DtdProcessing = DtdProcessing.Prohibit;\n${line.replace(/XmlReader\.Create\s*\(/i, 'XmlReader.Create(input, settings /* ')}`,
+                    explanation: 'Enforced DtdProcessing.Prohibit on XML reader to prevent XXE.'
+                };
+            }
+            return null;
+        }
+    },
+    // ── 22. Buffer Overflow (C/C++) ──────────────────────────────────────────
+    {
+        keywords: ['buffer overflow', 'unsafe string function', 'strcpy', 'strcat'],
+        apply: (line) => {
+            const ind = indent(line);
+            if (/\bstrcpy\s*\((.*?), (.*?)\)/.test(line)) {
+                const match = line.match(/\bstrcpy\s*\((.*?), (.*?)\)/);
+                if (match) {
+                    return {
+                        fix: `${ind}strncpy(${match[1]}, ${match[2]}, sizeof(${match[1]}) - 1);\n${ind}${match[1]}[sizeof(${match[1]}) - 1] = '\\0';`,
+                        explanation: 'Replaced strcpy with strncpy and ensured null-termination to prevent buffer overflow.'
+                    };
+                }
+            }
+            if (/\bgets\s*\(/.test(line)) {
+                return {
+                    fix: line.replace(/\bgets\s*\((.*?)\)/, 'fgets($1, sizeof($1), stdin)'),
+                    explanation: 'Replaced unsafe gets() with fgets().'
+                };
+            }
+            return null;
+        }
+    },
+    // ── 24. SSTI (Server Side Template Injection) ────────────────────────────
+    {
+        keywords: ['ssti', 'server-side template', 'dynamic input'],
+        apply: (line) => {
+            const ind = indent(line);
+            if (/\b(?:render_template_string|renderString)\s*\(/.test(line)) {
+                const callMatch = line.match(/\b(render_template_string|renderString)\s*\((.+)\)/);
+                if (callMatch) {
+                    const args = callMatch[2].split(',');
+                    const templateData = args.length > 1 ? args.slice(1).join(',').trim() : '{}';
+                    return {
+                        fix: `${ind}render_template('template_file.html', ${templateData}); /* use static file and pass data */`,
+                        explanation: 'Replaced string-based template rendering (SSTI risk) with file-based rendering and safe data passing.'
+                    };
+                }
+            }
+            return null;
+        }
+    },
+    // ── 25. IDOR (Insecure Direct Object Reference) ──────────────────────────
+    {
+        keywords: ['idor', 'direct use of user-supplied id'],
+        apply: (line) => {
+            const ind = indent(line);
+            if (/\bwhere\s+\w*id\s*=\s*/i.test(line)) {
+                return {
+                    fix: `${ind}// Verify ownership before query\n${ind}if (await db.checkAccess(req.user.id, resourceId)) {\n${ind}    ${line.trim()}\n${ind}}`,
+                    explanation: 'Added an authorization check block to prevent Insecure Direct Object Reference (IDOR).'
+                };
+            }
+            return null;
+        }
+    },
+    // ── 26. LDAP / XPATH Injection ───────────────────────────────────────────
+    {
+        keywords: ['ldap/xpath injection', 'concatenation'],
+        apply: (line) => {
+            const ind = indent(line);
+            if (/\b(Ldap|XPath|SelectNodes)\b/i.test(line)) {
+                const varMatch = line.match(/\+\s*([a-zA-Z_$][a-zA-Z0-9_$]*)/) || line.match(/,\s*['"`].*?\$\{(.+?)\}/);
+                const userVar = varMatch?.[1] ?? 'userInput';
+                const fixedLine = line.replace(new RegExp(`\\b${userVar}\\b`, 'g'), 'sanitizedInput');
+                return {
+                    fix: `${ind}const sanitizedInput = sanitizeInquiry(${userVar}); // TODO: implement sanitizeInquiry\n${fixedLine}`,
+                    explanation: 'Added input sanitization for LDAP/XPATH queries to prevent injection attacks.'
                 };
             }
             return null;
